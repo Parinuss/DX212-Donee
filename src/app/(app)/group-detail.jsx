@@ -6,6 +6,10 @@ export default function Page() {
   const { ScreenFrame, currentGroup, currentGroupTasks, gradientButton, hs, icon, memberName, navigate, openSheet, openTask, pendingGroupTasks, section, setSelectedMembers, setSelectedTasks, taskRows, user } = useDonee();
   return <ScreenFrame>{<>
             <View style={hs.profileHero}><View style={hs.avatar}>{icon(currentGroup.icon, 40, '#8654DA')}</View><Text style={hs.sectionTitle}>{currentGroup.name}</Text><Text style={hs.subtitle}>{currentGroup.members.length} members</Text></View>
+            {currentGroup.id && currentGroup.created_by === user.id && <View style={{ gap: 12, marginBottom: 16 }}>
+              <Pressable accessibilityRole="button" style={hs.outlineButton} onPress={() => openSheet('rename-group', { name: currentGroup.name })}>{icon('pencil-outline', 20, '#A487DD')}<Text style={[hs.link, { flexShrink: 1 }]}>เปลี่ยนชื่อกลุ่ม · Rename Group</Text></Pressable>
+              <Pressable accessibilityRole="button" style={hs.outlineButton} onPress={() => openSheet('delete-group')}>{icon('trash-outline', 20, '#B33965')}<Text style={[hs.link, { color: '#B33965', flexShrink: 1 }]}>ลบกลุ่ม · Delete Group</Text></Pressable>
+            </View>}
             {section('Members')}<View style={hs.chips}>{currentGroup.members.map(member => <Text key={member.id} style={hs.memberChip}>{member.name}{member.id === user.id ? ' (คุณ)' : ''}</Text>)}</View>
             {currentGroup.id && <>
               <Pressable style={[hs.outlineButton, { marginBottom: 16 }]} onPress={() => router.push({ pathname: '/group-chat', params: { groupId: currentGroup.id } })}><Text style={hs.link}>💬 Group Chat</Text></Pressable>

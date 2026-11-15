@@ -64,7 +64,7 @@ function Field({ icon, label, inputRef, secret, ...props }) {
 }
 
 export function LoginPage({ initialError, mode = 'Login' }) {
-  const tab = mode;
+  const [tab, setTab] = useState(mode);
   const [identifier, setIdentifier] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -76,7 +76,9 @@ export function LoginPage({ initialError, mode = 'Login' }) {
   const signup = tab === 'Sign Up';
 
   function changeTab(next) {
-    router.replace(next === 'Login' ? '/login' : '/register');
+    if (submitting || next === tab) return;
+    Keyboard.dismiss();
+    setTab(next);
     setMessage('');
     setPassword('');
     setConfirm('');
@@ -136,10 +138,10 @@ export function LoginPage({ initialError, mode = 'Login' }) {
 
                 <View style={styles.tabs} accessibilityRole="tablist">
                   {['Login', 'Sign Up'].map((item) => (
-                    <Pressable key={item} onPress={() => changeTab(item)}
-                      accessibilityRole="tab" accessibilityState={{ selected: tab === item }} style={styles.tab}>
+                    <Pressable key={item} disabled={submitting} onPress={() => changeTab(item)}
+                      accessibilityRole="tab" accessibilityState={{ selected: tab === item }} style={[styles.tab, tab === item && { backgroundColor: '#BD88D6' }]}>
                       {tab === item && <LinearGradient colors={['#DC91D2', '#BD88D6']}
-                        start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={StyleSheet.absoluteFillObject} />}
+                        start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={StyleSheet.absoluteFill} />}
                       <Text style={[styles.tabText, tab === item && styles.activeTab]}>{item}</Text>
                     </Pressable>
                   ))}
@@ -260,20 +262,43 @@ export function DoneeProvider({ user, children }) {
   const [sheet, setSheet] = useState(null);
   const [form, setForm] = useState({});
   const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
+  const [pageNotice, setPageNotice] = useState(null);
   const [selectedGroupId, setGroupId] = useState(null);
   const groupId = ['Group Detail', 'Randomize', 'Group Chat'].includes(active) && params.groupId ? String(params.groupId) : selectedGroupId;
+  // Include group identity and the Groups segment so messages cannot cross pages.
+  const noticeScopeFor = (path, id = null, tab = 'My Groups') => JSON.stringify([
+    path, ['/group-detail', '/randomize', '/group-chat'].includes(path) ? id : null,
+    path === '/groups' ? tab : null,
+  ]);
+  const noticeScope = noticeScopeFor(pathname, groupId, groupTab);
+  const activeNoticeScope = useRef(noticeScope);
+  const [previousNoticeScope, setPreviousNoticeScope] = useState(noticeScope);
+  if (previousNoticeScope !== noticeScope) {
+    setPreviousNoticeScope(noticeScope);
+    setPageNotice(current => current?.scope === noticeScope ? current : null);
+  }
+  useEffect(() => { activeNoticeScope.current = noticeScope; }, [noticeScope]);
+  const setNotice = useCallback((text, targetScope = noticeScope) => {
+    // Ignore responses from a page the user has already left.
+    if (text && activeNoticeScope.current !== noticeScope && activeNoticeScope.current !== targetScope) return;
+    setPageNotice(text ? { text, scope: targetScope } : null);
+  }, [noticeScope]);
+  const notice = pageNotice?.scope === noticeScope ? pageNotice.text : '';
   const [selectedTasks, setSelectedTasks] = useState([]);
   const [selectedMembers, setSelectedMembers] = useState([]);
   const [results, setResults] = useState([]);
   const [reminders, setReminders] = useState(true);
   const [taskBusy, setTaskBusy] = useState(false);
   const [groupBusy, setGroupBusy] = useState(false);
+  const managementLock = useRef(false);
   const [groupsState, setGroupsState] = useState('loading');
   const [databaseState, setDatabaseState] = useState('loading');
-  const loadTasks = useCallback(async () => {
+  const loadedData = useRef({ tasks: false, groups: false });
+  const refreshInFlight = useRef(null);
+  const loadTasks = useCallback(async ({ background = false } = {}) => {
+    const scope = activeNoticeScope.current;
     try {
-      setDatabaseState('loading');
+      if (!background || !loadedData.current.tasks) setDatabaseState('loading');
       const { data: existing, error: profileError } = await supabase.from('profiles').select('id,username,email').eq('id', user.id).maybeSingle();
       if (profileError) throw profileError;
       if (!existing) {
@@ -286,33 +311,54 @@ export function DoneeProvider({ user, children }) {
           if (!concurrentProfile) throw insertError;
         }
       } else {
-        setProfile({ name: existing.username || user.user_metadata?.username || 'Member', email: user.email || '' });
+        const nextProfile = { name: existing.username || user.user_metadata?.username || 'Member', email: user.email || '' };
+        setProfile(current => current.name === nextProfile.name && current.email === nextProfile.email ? current : nextProfile);
       }
       const rows = await taskRepository.list(user.id);
-      setTasks(rows);
+      setTasks(current => JSON.stringify(current) === JSON.stringify(rows) ? current : rows);
+      loadedData.current.tasks = true;
       setDatabaseState('ready');
-    } catch (loadError) { setDatabaseState('error'); setNotice(databaseMessage(loadError)); }
+    } catch (loadError) {
+      if (!background || !loadedData.current.tasks) setDatabaseState('error');
+      if (activeNoticeScope.current === scope) setPageNotice({ text: databaseMessage(loadError), scope });
+    }
   }, [user.id, user.email, user.user_metadata]);
-  const loadGroups = useCallback(async () => {
+  const loadGroups = useCallback(async ({ background = false } = {}) => {
+    const scope = activeNoticeScope.current;
     try {
-      setGroupsState('loading');
+      if (!background || !loadedData.current.groups) setGroupsState('loading');
       const rows = await groupRepository.list();
-      setGroups(rows); setGroupId(current => rows.some(group => group.id === current) ? current : rows[0]?.id || null);
+      setGroups(current => JSON.stringify(current) === JSON.stringify(rows) ? current : rows);
+      loadedData.current.groups = true;
+      setGroupId(current => rows.some(group => group.id === current) ? current : rows[0]?.id || null);
       setGroupsState('ready');
       return rows;
-    } catch (groupError) { setGroupsState('error'); setNotice(databaseMessage(groupError)); throw groupError; }
+    } catch (groupError) {
+      if (!background || !loadedData.current.groups) setGroupsState('error');
+      if (activeNoticeScope.current === scope) setPageNotice({ text: databaseMessage(groupError), scope });
+      throw groupError;
+    }
   }, []);
-  const reloadAll = useCallback(async () => {
-    await loadTasks();
-    await loadGroups().catch(() => {});
+  const reloadAll = useCallback((options = {}) => {
+    if (refreshInFlight.current) return refreshInFlight.current;
+    const refresh = (async () => {
+      await loadTasks(options);
+      await loadGroups(options).catch(() => {});
+    })();
+    refreshInFlight.current = refresh;
+    return refresh.finally(() => { refreshInFlight.current = null; });
   }, [loadTasks, loadGroups]);
   useEffect(() => { void Promise.resolve().then(reloadAll); }, [reloadAll]);
   useEffect(() => {
-    // Refresh on foreground/focus plus a small polling interval for other members' changes.
-    const interval = setInterval(() => { void reloadAll(); }, 20000);
-    const listener = AppState.addEventListener('change', state => { if (state === 'active') void reloadAll(); });
+    // Keep existing content visible during automatic refreshes; pause while editing.
+    const refresh = () => {
+      if (AppState.currentState !== 'active' || taskBusy || groupBusy || sheet) return;
+      void reloadAll({ background: true });
+    };
+    const interval = setInterval(refresh, 20000);
+    const listener = AppState.addEventListener('change', state => { if (state === 'active') refresh(); });
     return () => { clearInterval(interval); listener.remove(); };
-  }, [reloadAll]);
+  }, [reloadAll, taskBusy, groupBusy, sheet]);
   async function onLogout() {
     const { error: logoutError } = await supabase.auth.signOut();
     if (logoutError) setError(logoutError.message);
@@ -343,7 +389,7 @@ export function DoneeProvider({ user, children }) {
     else router.navigate(target);
   }
   function openSheet(name, data = {}) { setForm(data); setError(''); setSheet(name); }
-  function closeSheet() { setSheet(null); setError(''); }
+  function closeSheet() { if (managementLock.current) return; setSheet(null); setError(''); }
   async function toggleTask(taskId) {
     if (taskBusy) return;
     const task = tasks.find(item => item.id === taskId);
@@ -395,7 +441,7 @@ export function DoneeProvider({ user, children }) {
     try {
       await groupRepository.assign(currentGroup.id, results);
       closeSheet(); navigate('Group Detail');
-      await reloadAll(); setNotice('บันทึกผู้รับผิดชอบแล้ว');
+      await reloadAll(); setNotice('บันทึกผู้รับผิดชอบแล้ว', noticeScopeFor('/group-detail', currentGroup.id));
     } catch (assignmentError) { setError(databaseMessage(assignmentError)); }
     finally { setGroupBusy(false); }
   }
@@ -407,21 +453,53 @@ export function DoneeProvider({ user, children }) {
       const newId = await groupRepository.create(form.name);
       closeSheet(); setSelectedTasks([]); setSelectedMembers([user.id]);
       await loadGroups(); setGroupId(newId); router.navigate({ pathname: '/group-detail', params: { groupId: newId } });
-      setNotice('สร้างกลุ่มและรหัสเชิญแล้ว');
+      setNotice('สร้างกลุ่มและรหัสเชิญแล้ว', noticeScopeFor('/group-detail', newId));
     } catch (createError) { setError(databaseMessage(createError)); }
     finally { setGroupBusy(false); }
   }
-  async function joinByCode() {
+  async function joinByCode(code, reportError = setError) {
     if (groupBusy) return;
-    if (!form.invite_code?.trim()) return setError('Please enter an invite code.');
-    setGroupBusy(true); setError('');
+    const inviteCode = typeof code === 'string' ? code : form.invite_code;
+    if (!inviteCode?.trim()) return reportError('Please enter an invite code.');
+    setGroupBusy(true); reportError(''); setNotice('');
     try {
-      const joined = await groupRepository.join(form.invite_code);
+      const joined = await groupRepository.join(inviteCode);
+      if (joined.alreadyJoined) {
+        reportError('คุณเป็นสมาชิกกลุ่มนี้อยู่แล้ว');
+        return;
+      }
       closeSheet(); setSelectedTasks([]); setSelectedMembers([]);
       await loadGroups(); await loadTasks(); setGroupId(joined.id); router.navigate({ pathname: '/group-detail', params: { groupId: joined.id } });
-      setNotice(joined.alreadyJoined ? 'คุณเป็นสมาชิกกลุ่มนี้อยู่แล้ว' : 'เข้าร่วมกลุ่มสำเร็จ');
-    } catch (joinError) { setError(databaseMessage(joinError)); }
+      setNotice('เข้าร่วมกลุ่มสำเร็จ', noticeScopeFor('/group-detail', joined.id));
+    } catch (joinError) { reportError(databaseMessage(joinError)); }
     finally { setGroupBusy(false); }
+  }
+  async function manageGroup(remove = false) {
+    if (managementLock.current || groupBusy) return;
+    if (!currentGroup.id || currentGroup.created_by !== user.id) return setError('เฉพาะผู้สร้างกลุ่มเท่านั้น');
+    const name = form.name?.trim();
+    if (!remove && (!name || name.length > 60)) return setError('ชื่อกลุ่มต้องมี 1–60 ตัวอักษร');
+    const id = currentGroup.id;
+    managementLock.current = true; setGroupBusy(true); setError('');
+    try {
+      if (remove) {
+        await groupRepository.remove(id);
+        setGroups(rows => rows.filter(group => group.id !== id));
+        setTasks(rows => rows.filter(task => task.group_id !== id));
+        setGroupId(null); setSelectedTasks([]); setSelectedMembers([]); setResults([]);
+        setGroupTab('My Groups');
+        router.replace('/groups');
+        setNotice('ลบกลุ่มและไฟล์แนบแล้ว', noticeScopeFor('/groups'));
+      } else {
+        const renamed = await groupRepository.rename(id, name);
+        setGroups(rows => rows.map(group => group.id === id ? { ...group, name: renamed.name } : group));
+        setNotice('เปลี่ยนชื่อกลุ่มแล้ว');
+      }
+      setSheet(null); setError('');
+    } catch (failure) {
+      setError(failure?.code === 'PGRST202' ? 'กรุณารัน supabase/group-management.sql ใน Supabase SQL Editor ก่อน' : failure?.code === '42501' ? 'เฉพาะผู้สร้างกลุ่มเท่านั้น หรือสิทธิ์ Storage ยังไม่ครบ กรุณาตรวจ SQL แล้วลองใหม่' : databaseMessage(failure));
+    }
+    finally { managementLock.current = false; setGroupBusy(false); }
   }
   async function copyInviteCode() {
     try {
@@ -559,12 +637,13 @@ export function DoneeProvider({ user, children }) {
     </SafeAreaView>
 
   </LinearGradient>;
-  return <DoneeContext.Provider value={{ ScreenFrame, renderFrame, addButton, categoryFilter, completed, currentGroup, currentGroupTasks, filter, filteredTasks, gradientButton, groupRows, groupTab, groups, groupsState, hs, icon, localDate, memberName, navigate, openSheet, openTask, pendingGroupTasks, personalTasks, profile, query, renderCalendar, renderRandom, section, setCategoryFilter, setFilter, setGroupTab, setQuery, setSelectedMembers, setSelectedTasks, taskRows, tasks, user }}>{children}    <Modal visible={!!sheet} transparent animationType="slide" onRequestClose={closeSheet}>
+  return <DoneeContext.Provider value={{ ScreenFrame, renderFrame, addButton, categoryFilter, completed, currentGroup, currentGroupTasks, filter, filteredTasks, gradientButton, groupBusy, groupRows, groupTab, groups, groupsState, hs, icon, joinByCode, localDate, memberName, navigate, openSheet, openTask, pendingGroupTasks, personalTasks, profile, query, renderCalendar, renderRandom, section, setCategoryFilter, setFilter, setGroupTab, setQuery, setSelectedMembers, setSelectedTasks, taskRows, tasks, user }}>{children}
+    <Modal visible={!!sheet} transparent animationType="slide" onRequestClose={closeSheet}>
       <KeyboardAvoidingView style={hs.overlay} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-        <Pressable style={StyleSheet.absoluteFillObject} onPress={closeSheet} accessibilityLabel="Close dialog" />
+        <Pressable style={StyleSheet.absoluteFill} onPress={closeSheet} accessibilityLabel="Close dialog" />
         <View style={hs.dialog} accessibilityViewIsModal>
           <View style={hs.handle} />
-          <View style={hs.dialogHeader}><Text style={hs.sectionTitle}>{({ task: form.id ? 'Edit task' : form.group_id ? 'Add a group task' : 'Add a new task', 'create-group': 'Create Group', invite: 'เชิญเพื่อน · Invite Friends', 'join-group': 'เข้าร่วมด้วยรหัส', 'choose-group': 'Select a group', members: 'Select members', result: 'Your Tasks Are Assigned!', profile: 'My Profile', settings: 'Settings', help: 'Help & Support', logout: 'Log Out', filter: 'Filter tasks', notifications: 'Notifications' })[sheet]}</Text><Pressable accessibilityRole="button" accessibilityLabel="Close" onPress={closeSheet} hitSlop={10}>{icon('close', 23)}</Pressable></View>
+          <View style={hs.dialogHeader}><Text style={hs.sectionTitle}>{({ task: form.id ? 'Edit task' : form.group_id ? 'Add a group task' : 'Add a new task', 'create-group': 'Create Group', 'rename-group': 'เปลี่ยนชื่อกลุ่ม', 'delete-group': 'ยืนยันลบกลุ่ม', invite: 'เชิญเพื่อน · Invite Friends', 'join-group': 'เข้าร่วมด้วยรหัส', 'choose-group': 'Select a group', members: 'Select members', result: 'Your Tasks Are Assigned!', profile: 'My Profile', settings: 'Settings', help: 'Help & Support', logout: 'Log Out', filter: 'Filter tasks', notifications: 'Notifications' })[sheet]}</Text><Pressable accessibilityRole="button" accessibilityLabel="Close" onPress={closeSheet} hitSlop={10}>{icon('close', 23)}</Pressable></View>
           <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 15 }}>
             {sheet === 'task' && <>
               {textInput('Task name', 'title', 'Task name...', { maxLength: 120 })}
@@ -574,6 +653,8 @@ export function DoneeProvider({ user, children }) {
               {form.id && <Pressable style={hs.selectionRow} accessibilityRole="checkbox" accessibilityState={{ checked: form.done }} onPress={() => updateForm('done', !form.done)}>{icon(form.done ? 'checkbox' : 'square-outline', 22, '#A487DD')}<Text style={hs.rowText}>Completed</Text></Pressable>}
             </>}
             {sheet === 'create-group' && <>{textInput('Group name', 'name', 'e.g. Project Team', { maxLength: 60 })}<Text style={hs.small}>You are included automatically.</Text></>}
+            {sheet === 'rename-group' && textInput('ชื่อกลุ่ม', 'name', 'ชื่อกลุ่ม', { maxLength: 60, editable: !groupBusy })}
+            {sheet === 'delete-group' && <Text style={hs.helpText}>ต้องการลบกลุ่ม “{currentGroup.name}” หรือไม่? กลุ่ม สมาชิกภาพ งานกลุ่ม ข้อความ และไฟล์แนบจะถูกลบถาวร บัญชีสมาชิก งานส่วนตัว และกลุ่มอื่นยังอยู่ หากลบไฟล์ไม่ครบ กลุ่มจะอยู่ในสถานะรอลบและปิดการเพิ่มข้อมูล ให้กดลองลบอีกครั้ง</Text>}
             {sheet === 'invite' && <View style={hs.resultHero}>
               <Text style={hs.sectionTitle}>{currentGroup.name}</Text>
               <Text style={hs.subtitle}>ส่งรหัสนี้ให้เพื่อน เพื่อเข้าร่วมกลุ่ม</Text>
@@ -595,6 +676,10 @@ export function DoneeProvider({ user, children }) {
             {sheet === 'logout' && <Text style={hs.subtitle}>ออกจากระบบหรือไม่? งาน กลุ่ม และสมาชิกที่บันทึกไว้จะยังอยู่</Text>}
             {!!error && <Text accessibilityRole="alert" style={styles.error}>{error}</Text>}
             <View style={{ marginTop: 20 }}>
+              {['rename-group', 'delete-group'].includes(sheet) && <>
+                {gradientButton(groupBusy ? 'กำลังดำเนินการ…' : sheet === 'delete-group' ? 'ยืนยันลบกลุ่ม / ลองใหม่' : 'บันทึก', () => manageGroup(sheet === 'delete-group'), groupBusy)}
+                <Pressable accessibilityRole="button" disabled={groupBusy} onPress={closeSheet} style={{ alignItems: 'center', marginTop: 18 }}><Text style={hs.link}>ยกเลิก</Text></Pressable>
+              </>}
               {sheet === 'invite' && gradientButton('คัดลอกรหัส · Copy Code', copyInviteCode)}
               {sheet === 'join-group' && gradientButton(groupBusy ? 'กำลังเข้าร่วม…' : 'เข้าร่วมกลุ่ม · Join Group', joinByCode, groupBusy)}
               {sheet === 'task' && <Pressable accessibilityRole="button" disabled={taskBusy} onPress={saveTask}><LinearGradient colors={ACTION} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={hs.primary}><Text style={hs.primaryText}>{taskBusy ? 'กำลังบันทึก…' : 'Save'}</Text></LinearGradient></Pressable>}

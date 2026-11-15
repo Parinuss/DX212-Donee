@@ -53,3 +53,45 @@ test('rejected group operations do not report success', async () => {
   const f=clientWith({donee_join_group:{code:'42501',message:'Not allowed'}});
   await assert.rejects(()=>createGroupRepository(f.client).join('ABC123'),e=>e.code==='42501');
 });
+
+
+test('rename sends only trimmed name and group ID', async () => {
+  const f=clientWith({donee_rename_group:{id:'10',name:'New'}});
+  assert.deepEqual(await createGroupRepository(f.client).rename('10',' New '),{id:'10',name:'New'});
+  assert.deepEqual(f.calls[0].body,{p_group_id:'10',p_name:'New'});
+});
+
+function deletionClient(batches, failure = null) {
+  const calls=[];
+  return { calls, client: {
+    rpc: async (name,args) => {
+      calls.push({name,args});
+      return {data:name==='donee_begin_delete_group'?batches.shift():true,error:null};
+    },
+    storage: { from: bucket => ({remove: async paths => { calls.push({bucket,paths}); return {error:failure}; }}) },
+  }};
+}
+
+test('delete removes every storage batch before final DB transaction', async () => {
+  const f=deletionClient([['10/a','10/orphan'],['10/b'],[]]);
+  await createGroupRepository(f.client).remove('10');
+  assert.deepEqual(f.calls.map(c=>c.name||c.bucket),['donee_begin_delete_group','chat-images','donee_begin_delete_group','chat-images','donee_begin_delete_group','donee_finish_delete_group']);
+  assert(f.calls.filter(c=>c.args).every(c=>JSON.stringify(c.args)==='{"p_group_id":"10"}'));
+});
+
+test('partial storage failure stops deletion and can be retried', async () => {
+  const f=deletionClient([['10/a']],{message:'Network error'});
+  await assert.rejects(()=>createGroupRepository(f.client).remove('10'),/ลองอีกครั้ง/);
+  assert(!f.calls.some(c=>c.name==='donee_finish_delete_group'));
+  const retry=deletionClient([['10/a'],[]]);
+  await createGroupRepository(retry.client).remove('10');
+  assert.equal(retry.calls.at(-1).name,'donee_finish_delete_group');
+});
+
+test('silent storage no-op and cross-group paths cannot report successful deletion', async () => {
+  for (const batches of [[['10/a'],['10/a']],[['11/foreign']]]) {
+    const f=deletionClient(batches);
+    await assert.rejects(()=>createGroupRepository(f.client).remove('10'));
+    assert(!f.calls.some(c=>c.name==='donee_finish_delete_group'));
+  }
+});
